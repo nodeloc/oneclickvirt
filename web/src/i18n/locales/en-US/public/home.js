@@ -1,12 +1,12 @@
 export default {
-  title: 'OneClickVirt',
+  title: 'NodeLoc',
   nav: {
     login: 'Login',
     register: 'Register'
   },
   hero: {
-    title: 'Open Source Virtualization Management Platform',
-    description: 'OneClickVirt provides an easy-to-use open-source virtual machine and container management platform, supporting multiple virtualization technologies.',
+    title: 'Shared Virtualization Management Platform',
+    description: 'NodeLoc provides an easy-to-use virtual machine and container management platform, supporting multiple virtualization technologies.',
     loginButton: 'Account Login',
     registerButton: 'Register Now'
   },

@@ -8,7 +8,7 @@
   >
     <div class="sidebar-logo">
       <h1 v-show="!isCollapse || isMobile">
-        OneClickVirt
+        Share.NodeLoc
       </h1>
       <el-button 
         v-if="!isMobile"

@@ -1,12 +1,12 @@
 export default {
-  title: 'OneClickVirt',
+  title: 'NodeLoc',
   nav: {
     login: '登录',
     register: '注册'
   },
   hero: {
-    title: '开源虚拟化管理平台',
-    description: 'OneClickVirt 提供开源简单易用的虚拟机和容器管理，支持多种虚拟化开设。',
+    title: '共享虚拟化管理平台',
+    description: 'NodeLoc 提供简单易用的虚拟机和容器管理，支持多种虚拟化开设。',
     loginButton: '帐户登录',
     registerButton: '注册使用'
   },
@@ -48,7 +48,7 @@ export default {
     feedback: '问题反馈',
     communityGroup: '交流群组',
     allRightsReserved: 'All rights reserved.',
-    openSourceProject: '一键虚拟化旗下开源项目'
+    openSourceProject: 'Power by OneClickVirt '
   },
   errors: {
     fetchAnnouncementsFailed: '获取公告失败:',

@@ -159,6 +159,14 @@
             <el-button
               size="small"
               type="primary"
+              @click="applyPreset('nodeloc')"
+            >
+              <el-icon><Connection /></el-icon>
+              NodeLoc
+            </el-button>
+            <el-button
+              size="small"
+              type="primary"
               @click="applyPreset('linuxdo')"
             >
               <el-icon><Connection /></el-icon>

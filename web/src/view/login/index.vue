@@ -6,10 +6,9 @@
         <div class="logo">
           <img
             src="@/assets/images/logo.png"
-            alt="OneClickVirt Logo"
+            alt="Nodeloc Logo"
             class="logo-image"
           >
-          <h1>OneClickVirt</h1>
         </div>
         <nav class="nav-actions">
           <button
@@ -339,7 +338,6 @@ onMounted(() => {
 }
 
 .logo-image {
-  width: 48px;
   height: 48px;
   object-fit: contain;
 }
