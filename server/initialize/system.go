@@ -132,13 +132,6 @@ func initializeLogRotation() {
 					} else {
 						global.APP_LOG.Info("日志清理完成")
 					}
-
-					// 压缩符合条件的日志文件（包括旧日志和当天已轮转的日志）
-					if err := logRotationService.CompressOldLogs(); err != nil {
-						global.APP_LOG.Error("日志压缩失败", zap.Error(err))
-					} else {
-						global.APP_LOG.Info("日志压缩完成")
-					}
 				case <-global.APP_SHUTDOWN_CONTEXT.Done():
 					// 系统关闭，停止日志轮转任务
 					timer.Stop()
@@ -148,50 +141,6 @@ func initializeLogRotation() {
 				// timer已经被使用或停止，无需再次停止
 			}
 		}()
-
-		// 启动定时压缩任务（每小时执行一次）
-		// 此任务与凌晨3点的清理任务互补：
-		// - 凌晨3点任务：清理过期日志目录 + 压缩所有符合条件的日志
-		// - 每小时任务：及时压缩当天已轮转的日志文件，节省存储空间
-		// 两个任务都调用CompressOldLogs()，该函数内部会判断具体压缩哪些文件
-		if global.APP_CONFIG.Zap.CompressLogs {
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						global.APP_LOG.Error("日志压缩任务panic", zap.Any("panic", r))
-					}
-				}()
-
-				// 首次执行延迟5分钟，避免启动时的资源竞争
-				timer := time.NewTimer(5 * time.Minute)
-				select {
-				case <-timer.C:
-					// 执行压缩
-					if err := logRotationService.CompressOldLogs(); err != nil {
-						global.APP_LOG.Error("日志压缩失败", zap.Error(err))
-					}
-				case <-global.APP_SHUTDOWN_CONTEXT.Done():
-					timer.Stop()
-					return
-				}
-
-				// 每小时执行一次
-				ticker := time.NewTicker(1 * time.Hour)
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-ticker.C:
-						if err := logRotationService.CompressOldLogs(); err != nil {
-							global.APP_LOG.Error("日志压缩失败", zap.Error(err))
-						}
-					case <-global.APP_SHUTDOWN_CONTEXT.Done():
-						global.APP_LOG.Info("日志压缩任务已停止")
-						return
-					}
-				}
-			}()
-		}
 	}
 }
 
@@ -214,9 +163,26 @@ func CheckSystemInitialized() bool {
 		return false
 	}
 
+	// 检查users表是否存在
+	if !global.APP_DB.Migrator().HasTable("users") {
+		global.APP_LOG.Debug("users表不存在，系统未初始化")
+		return false
+	}
+
 	// 检查是否有用户数据（作为初始化完成的标志）
+	// 使用defer+recover防止可能的panic
 	var userCount int64
-	err = global.APP_DB.Table("users").Count(&userCount).Error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				global.APP_LOG.Warn("查询用户表时发生panic", zap.Any("panic", r))
+				userCount = 0
+			}
+		}()
+
+		err = global.APP_DB.Table("users").Count(&userCount).Error
+	}()
+
 	if err != nil {
 		// 如果表不存在或查询失败，说明未初始化
 		global.APP_LOG.Debug("查询用户表失败，系统未初始化", zap.Error(err))
@@ -234,8 +200,17 @@ func CheckSystemInitialized() bool {
 
 // InitializeFullSystem 执行完整的系统初始化（仅在系统已初始化时调用）
 func InitializeFullSystem() {
-	// 注册数据库表
+	// 确保数据库连接存在
+	if global.APP_DB == nil {
+		global.APP_LOG.Warn("数据库未连接，跳过完整系统初始化")
+		return
+	}
+
+	// 注册数据库表（确保表结构是最新的）
+	// 注意：这里不会重复迁移，只是确保表结构完整
+	global.APP_LOG.Debug("确保数据库表结构完整")
 	RegisterTables(global.APP_DB)
+
 	InitializeConfigManager()
 	global.APP_LOG.Debug("数据库连接和表注册完成")
 
