@@ -180,15 +180,14 @@ func (s *Service) prepareInstanceCreation(ctx context.Context, task *adminModel.
 		// 生成实例名称
 		instanceName := s.generateInstanceName(provider.Name)
 
-		// 设置实例到期时间，与Provider的到期时间同步
-		var expiredAt time.Time
+		// 设置实例到期时间
+		// 默认与Provider的到期时间同步，但如果Provider没有到期时间则使用1年后
+		var expiredAt *time.Time
 		if provider.ExpiresAt != nil {
 			// 如果Provider有到期时间，使用Provider的到期时间
-			expiredAt = *provider.ExpiresAt
-		} else {
-			// 如果Provider没有到期时间，默认为1年后
-			expiredAt = time.Now().AddDate(1, 0, 0)
+			expiredAt = provider.ExpiresAt
 		}
+		// 如果Provider没有到期时间，实例也不设置到期时间（由管理员手动管理）
 
 		// 创建实例记录
 		instance = providerModel.Instance{
@@ -204,7 +203,8 @@ func (s *Service) prepareInstanceCreation(ctx context.Context, task *adminModel.
 			UserID:             task.UserID,
 			Status:             "creating",
 			OSType:             systemImage.OSType,
-			ExpiredAt:          expiredAt,
+			ExpiresAt:          expiredAt,
+			IsManualExpiry:     false, // 默认非手动设置，跟随节点
 			MaxTraffic:         0,     // 默认为0，表示继承用户等级限制，不单独限制实例
 			TrafficLimited:     false, // 显式设置为false，确保不会因流量误判为超限
 			TrafficLimitReason: "",    // 初始无限制原因
@@ -858,7 +858,7 @@ func (s *Service) finalizeInstanceCreation(ctx context.Context, task *adminModel
 		if err := tx.Model(instance).Updates(instanceUpdates).Error; err != nil {
 			return fmt.Errorf("更新实例信息失败: %v", err)
 		}
-		// 更新用户配额
+		// 确认待确认配额（将pending_quota转为used_quota）
 		quotaService := resources.NewQuotaService()
 		resourceUsage := resources.ResourceUsage{
 			CPU:       instance.CPU,
@@ -866,12 +866,13 @@ func (s *Service) finalizeInstanceCreation(ctx context.Context, task *adminModel
 			Disk:      instance.Disk,
 			Bandwidth: instance.Bandwidth,
 		}
-		if err := quotaService.UpdateUserQuotaAfterCreationWithTx(tx, task.UserID, resourceUsage); err != nil {
-			global.APP_LOG.Error("更新用户配额失败",
+		// 实例创建成功，将待确认配额转为已使用配额
+		if err := quotaService.ConfirmPendingQuota(tx, task.UserID, resourceUsage); err != nil {
+			global.APP_LOG.Error("确认用户配额失败",
 				zap.Uint("taskId", task.ID),
 				zap.Uint("userId", task.UserID),
 				zap.Error(err))
-			return fmt.Errorf("更新用户配额失败: %v", err)
+			return fmt.Errorf("确认用户配额失败: %v", err)
 		}
 		// 更新任务状态为处理中，等待后处理任务完成
 		if err := tx.Model(task).Updates(map[string]interface{}{

@@ -2,6 +2,7 @@ package log
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"oneclickvirt/service/storage"
@@ -20,6 +21,68 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// CleanupCoordinator 全局清理协调器，防止并发清理冲突
+type CleanupCoordinator struct {
+	mu             sync.Mutex
+	lastCleanupDay string     // 最后清理的日期
+	cleanupOnce    *sync.Once // 每天的清理只执行一次
+	ctx            context.Context
+}
+
+var (
+	globalCleanupCoordinator *CleanupCoordinator
+	cleanupCoordinatorOnce   sync.Once
+)
+
+// GetCleanupCoordinator 获取全局清理协调器
+func GetCleanupCoordinator() *CleanupCoordinator {
+	cleanupCoordinatorOnce.Do(func() {
+		globalCleanupCoordinator = &CleanupCoordinator{
+			cleanupOnce: &sync.Once{},
+			ctx:         context.Background(),
+		}
+	})
+	return globalCleanupCoordinator
+}
+
+// SetContext 设置上下文（用于优雅关闭）
+func (c *CleanupCoordinator) SetContext(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ctx = ctx
+}
+
+// ShouldCleanup 检查是否应该执行清理（每天只允许一次）
+func (c *CleanupCoordinator) ShouldCleanup() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 检查上下文是否已取消
+	select {
+	case <-c.ctx.Done():
+		return false
+	default:
+	}
+
+	todayStr := time.Now().Format("2006-01-02")
+	if c.lastCleanupDay != todayStr {
+		// 新的一天，重置sync.Once
+		c.lastCleanupDay = todayStr
+		c.cleanupOnce = &sync.Once{}
+		return true
+	}
+	return false
+}
+
+// ExecuteCleanup 执行清理（通过sync.Once保证只执行一次）
+func (c *CleanupCoordinator) ExecuteCleanup(cleanupFunc func() error) error {
+	var err error
+	c.cleanupOnce.Do(func() {
+		err = cleanupFunc()
+	})
+	return err
+}
+
 // LogRotationService 日志轮转服务
 type LogRotationService struct {
 	mu      sync.RWMutex
@@ -37,6 +100,10 @@ func GetLogRotationService() *LogRotationService {
 		logRotationService = &LogRotationService{
 			writers: make(map[string]*RotatingFileWriter),
 		}
+		// 初始化cleanup coordinator的上下文
+		if global.APP_SHUTDOWN_CONTEXT != nil {
+			GetCleanupCoordinator().SetContext(global.APP_SHUTDOWN_CONTEXT)
+		}
 	})
 	return logRotationService
 }
@@ -46,9 +113,16 @@ func (s *LogRotationService) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, writer := range s.writers {
-		// 忽略关闭错误，避免日志调用导致递归死锁
-		_ = writer.Close()
+	for level, writer := range s.writers {
+		// 先同步数据到磁盘
+		if err := writer.Sync(); err != nil {
+			// 只记录到stderr，避免递归日志调用
+			fmt.Fprintf(os.Stderr, "[WARN] 同步日志文件失败 [%s]: %v\n", level, err)
+		}
+		// 关闭文件
+		if err := writer.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] 关闭日志文件失败 [%s]: %v\n", level, err)
+		}
 	}
 	s.writers = make(map[string]*RotatingFileWriter)
 }
@@ -107,21 +181,17 @@ func NewRotatingFileWriter(level string, config *config.DailyLogConfig) *Rotatin
 // Write 实现 io.Writer 接口
 func (w *RotatingFileWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	// 如果连续失败太多次，跳过复杂的轮转逻辑，直接尝试写入
-	// 避免在文件系统异常时无限循环
-	if w.failCount > 5 && time.Since(w.lastFailTime) < 10*time.Second {
-		// 降级模式：尝试直接写入，如果失败就丢弃日志
+	defer func() {
+		// 每次写入后都关闭文件，避免文件句柄一直持有
 		if w.file != nil {
-			n, err = w.file.Write(p)
-			if err == nil {
-				w.failCount = 0 // 成功后重置失败计数
-				w.size += int64(n)
-				return n, nil
-			}
+			_ = w.file.Close()
+			w.file = nil
 		}
-		// 降级模式下也失败，丢弃日志但不返回错误，避免阻塞应用
+		w.mu.Unlock()
+	}()
+
+	// 降级模式：如果连续失败太多次，直接丢弃日志
+	if w.failCount > 5 && time.Since(w.lastFailTime) < 10*time.Second {
 		return len(p), nil
 	}
 
@@ -131,33 +201,48 @@ func (w *RotatingFileWriter) Write(p []byte) (n int, err error) {
 	}
 	todayStr := now.Format("2006-01-02")
 
-	// 如果文件未打开，先打开
-	if w.file == nil {
-		if err := w.openNewFile(); err != nil {
-			w.failCount++
-			w.lastFailTime = now
-			// 返回成功但实际丢弃日志，避免阻塞应用
-			return len(p), nil
+	// 检查日期是否变化（轮转触发）
+	if w.currentDate != "" && w.currentDate != todayStr {
+		// 日期变化，触发清理（异步）
+		coordinator := GetCleanupCoordinator()
+		if coordinator.ShouldCleanup() {
+			go func() {
+				_ = coordinator.ExecuteCleanup(func() error {
+					return w.cleanup()
+				})
+			}()
 		}
+		// 重置大小计数
+		w.size = 0
 	}
 
-	// 检查日期是否变化，如果变化则切换到新日期的目录
-	if w.currentDate != todayStr {
-		// 日期变化，切换到新日期目录
-		if err := w.rotate(); err != nil {
-			w.failCount++
-			w.lastFailTime = now
-			// 轮转失败，尝试继续使用当前文件
-			// 不返回错误，避免阻塞应用
-		}
+	// 构建文件路径
+	filename := w.getCurrentLogFilename()
+	director := filepath.Dir(filename)
+
+	// 创建目录
+	err = os.MkdirAll(director, os.ModePerm)
+	if err != nil {
+		w.failCount++
+		w.lastFailTime = now
+		fmt.Fprintf(os.Stderr, "[ERROR] 创建日志目录失败 [%s] %s: %v\n", w.level, director, err)
+		return len(p), nil
 	}
 
-	// 检查是否需要按大小轮转
-	if w.size+int64(len(p)) > w.config.MaxSize {
-		if err := w.rotate(); err != nil {
-			// 轮转失败，继续使用当前文件，只是可能超出大小限制
-			// 不返回错误，避免阻塞应用
-		}
+	// 检查旧日志清理
+	err = w.removeOldLogs(w.config.BaseDir, w.config.MaxAge)
+	if err != nil {
+		// 清理失败不影响写入
+		fmt.Fprintf(os.Stderr, "[WARN] 清理旧日志失败: %v\n", err)
+	}
+
+	// 打开文件（追加模式）
+	w.file, err = os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		w.failCount++
+		w.lastFailTime = now
+		fmt.Fprintf(os.Stderr, "[ERROR] 打开日志文件失败 [%s] %s: %v\n", w.level, filename, err)
+		return len(p), nil
 	}
 
 	// 写入数据
@@ -165,183 +250,49 @@ func (w *RotatingFileWriter) Write(p []byte) (n int, err error) {
 	if err != nil {
 		w.failCount++
 		w.lastFailTime = now
-		// 写入失败，关闭文件并标记为需要重新打开
-		_ = w.file.Close()
-		w.file = nil
-		w.size = 0
-		// 返回成功但实际丢弃日志，避免阻塞应用
+		fmt.Fprintf(os.Stderr, "[ERROR] 写入日志失败 [%s]: %v\n", w.level, err)
 		return len(p), nil
 	}
 
-	// 写入成功，重置失败计数
+	// 更新状态
 	w.failCount = 0
+	w.currentDate = todayStr
 	w.size += int64(n)
+
 	return n, nil
 }
 
-// openNewFile 打开新的日志文件
-func (w *RotatingFileWriter) openNewFile() error {
-	// 确保目录存在
-	if err := os.MkdirAll(w.config.BaseDir, 0755); err != nil {
-		return fmt.Errorf("创建日志目录失败: %w", err)
-	}
-
-	// 获取当前日志文件路径
-	filename := w.getCurrentLogFilename()
-
-	// 打开文件
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("打开日志文件失败: %w", err)
-	}
-
-	// 获取当前文件大小
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return fmt.Errorf("获取文件信息失败: %w", err)
-	}
-
-	w.file = file
-	w.size = info.Size()
-
-	// 更新当前日期
-	now := time.Now()
-	if !w.config.LocalTime {
-		now = now.UTC()
-	}
-	w.currentDate = now.Format("2006-01-02")
-
-	return nil
-}
-
-// getCurrentLogFilename 获取当前日志文件名
-// 如果当前日志文件未达到MaxSize，返回现有文件名
-// 否则返回带时间戳的新文件名
+// getCurrentLogFilename 获取当前日志文件名（简化版本）
 func (w *RotatingFileWriter) getCurrentLogFilename() string {
 	now := time.Now()
 	if !w.config.LocalTime {
 		now = now.UTC()
 	}
 
-	// 创建按日期分组的目录结构：storage/logs/2025-01-07/
+	// 创建按日期分组的目录结构：storage/logs/2006-01-02/level.log
 	dateStr := now.Format("2006-01-02")
 	dateDir := filepath.Join(w.config.BaseDir, dateStr)
-
-	// 确保日期目录存在
-	if err := os.MkdirAll(dateDir, 0755); err != nil {
-		if global.APP_LOG != nil {
-			global.APP_LOG.Error("创建日期日志目录失败",
-				zap.String("dir", dateDir),
-				zap.Error(err))
-		}
-		// 如果创建失败，回退到基础目录
-		return filepath.Join(w.config.BaseDir, fmt.Sprintf("%s.log", w.level))
-	}
-
-	// 主日志文件名
-	baseLogFile := filepath.Join(dateDir, fmt.Sprintf("%s.log", w.level))
-
-	// 检查主日志文件是否存在以及大小
-	if info, err := os.Stat(baseLogFile); err == nil {
-		// 文件存在，检查大小
-		if info.Size() < w.config.MaxSize {
-			// 文件未达到最大大小，继续使用当前文件
-			return baseLogFile
-		}
-		// 文件已达到最大大小，需要生成新文件名
-		// 继续往下执行，生成带时间戳的新文件名
-	} else if os.IsNotExist(err) {
-		// 文件不存在，使用基础文件名
-		return baseLogFile
-	}
-
-	// 文件已达到最大大小或出现其他错误，生成带时间戳的新文件名
-	// 格式：level-20060102-150405.log
-	timeStr := now.Format("20060102-150405")
-	return filepath.Join(dateDir, fmt.Sprintf("%s-%s.log", w.level, timeStr))
+	return filepath.Join(dateDir, fmt.Sprintf("%s.log", w.level))
 }
 
-// rotate 轮转日志文件
-func (w *RotatingFileWriter) rotate() error {
-	// 如果需要轮转，先重命名当前文件
-	if w.file != nil {
-		currentPath := w.file.Name()
-
-		// 关闭当前文件（忽略错误，避免日志调用导致递归死锁）
-		_ = w.file.Close()
-		w.file = nil
-		w.size = 0
-
-		// 如果当前文件是主日志文件（不带时间戳），需要重命名
-		// 重命名失败不影响继续创建新文件
-		if !w.hasTimestamp(currentPath) {
-			_ = w.renameWithTimestamp(currentPath)
+// removeOldLogs 清理旧日志
+func (w *RotatingFileWriter) removeOldLogs(dir string, days int) error {
+	if days <= 0 {
+		return nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-	}
-
-	// 清理旧文件（在后台异步执行，避免阻塞日志写入）
-	go func() {
-		_ = w.cleanup()
-	}()
-
-	// 打开新文件
-	return w.openNewFile()
-}
-
-// hasTimestamp 检查文件名是否包含时间戳
-func (w *RotatingFileWriter) hasTimestamp(filePath string) bool {
-	filename := filepath.Base(filePath)
-	// 匹配格式: level-20060102-150405.log
-	matched, _ := regexp.MatchString(`\w+-\d{8}-\d{6}\.log`, filename)
-	return matched
-}
-
-// renameWithTimestamp 将文件重命名为带时间戳的格式
-func (w *RotatingFileWriter) renameWithTimestamp(oldPath string) error {
-	// 获取文件的修改时间
-	info, err := os.Stat(oldPath)
-	if err != nil {
-		return err
-	}
-
-	modTime := info.ModTime()
-	if !w.config.LocalTime {
-		modTime = modTime.UTC()
-	}
-
-	// 生成新文件名: level-20060102-150405.log
-	timeStr := modTime.Format("20060102-150405")
-	dirPath := filepath.Dir(oldPath)
-	newPath := filepath.Join(dirPath, fmt.Sprintf("%s-%s.log", w.level, timeStr))
-
-	// 如果新文件名已存在，添加递增数字
-	if _, err := os.Stat(newPath); err == nil {
-		found := false
-		for i := 1; i < 1000; i++ {
-			newPath = filepath.Join(dirPath, fmt.Sprintf("%s-%s-%d.log", w.level, timeStr, i))
-			if _, err := os.Stat(newPath); os.IsNotExist(err) {
-				found = true
-				break
+		if info.IsDir() && info.ModTime().Before(cutoff) && path != dir {
+			err = os.RemoveAll(path)
+			if err != nil {
+				return err
 			}
 		}
-		if !found {
-			return fmt.Errorf("无法找到可用的文件名，已尝试1000次")
-		}
-	}
-
-	// 重命名文件
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return fmt.Errorf("重命名文件失败 %s -> %s: %w", oldPath, newPath, err)
-	}
-
-	if global.APP_LOG != nil {
-		global.APP_LOG.Debug("日志文件已重命名",
-			zap.String("from", oldPath),
-			zap.String("to", newPath))
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // cleanup 清理旧的日志文件
@@ -367,41 +318,62 @@ func (w *RotatingFileWriter) cleanup() error {
 		return dateDirs[i] > dateDirs[j]
 	})
 
-	// 删除超过保留数量的目录
-	deletedByCount := 0
+	// 计算需要删除的目录（避免重复删除）
+	toDelete := make(map[string]bool)
+
+	// 标记超过保留数量的目录
 	if len(dateDirs) > w.config.MaxBackups {
 		for _, dateDir := range dateDirs[w.config.MaxBackups:] {
-			dirPath := filepath.Join(w.config.BaseDir, dateDir)
-			os.RemoveAll(dirPath)
-			deletedByCount++
+			toDelete[dateDir] = true
 		}
 	}
 
-	// 删除超过保留时间的目录
+	// 标记超过保留时间的目录
 	cutoff := time.Now().AddDate(0, 0, -w.config.MaxAge)
 	cutoffDateStr := cutoff.Format("2006-01-02")
-
-	deletedByAge := 0
 	for _, dateDir := range dateDirs {
 		if dateDir < cutoffDateStr {
-			dirPath := filepath.Join(w.config.BaseDir, dateDir)
-			os.RemoveAll(dirPath)
-			deletedByAge++
+			toDelete[dateDir] = true
 		}
 	}
 
-	// 删除结果不记录日志，避免递归调用
-	// 可以通过检查文件系统来验证清理结果
-	_ = deletedByCount
-	_ = deletedByAge
+	// 执行删除
+	deletedCount := 0
+	for dateDir := range toDelete {
+		dirPath := filepath.Join(w.config.BaseDir, dateDir)
+		if err := os.RemoveAll(dirPath); err != nil {
+			// 只记录到stderr，避免递归日志调用
+			fmt.Fprintf(os.Stderr, "[WARN] 删除旧日志目录失败 [%s]: %v\n", dirPath, err)
+		} else {
+			deletedCount++
+		}
+	}
+
+	// 输出清理结果到stderr
+	if deletedCount > 0 {
+		fmt.Fprintf(os.Stderr, "[INFO] 清理了 %d 个旧日志目录\n", deletedCount)
+	}
 
 	return nil
-} // Close 关闭文件写入器
+} // Sync 同步数据到磁盘
+func (w *RotatingFileWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file != nil {
+		return w.file.Sync()
+	}
+	return nil
+}
+
+// Close 关闭文件写入器
 func (w *RotatingFileWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.file != nil {
+		// 关闭前先同步
+		_ = w.file.Sync()
 		err := w.file.Close()
 		w.file = nil
 		w.size = 0
@@ -486,44 +458,77 @@ func (s *LogRotationService) customTimeEncoder(t time.Time, enc zapcore.Primitiv
 	enc.AppendString(t.Format(global.APP_CONFIG.Zap.Prefix + "2006/01/02 - 15:04:05.000"))
 }
 
-// CleanupOldLogs 清理旧日志文件
+// CleanupOldLogs 清理旧日志文件（通过全局协调器执行）
 func (s *LogRotationService) CleanupOldLogs() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 使用全局协调器确保不会与rotate的cleanup并发执行
+	coordinator := GetCleanupCoordinator()
 
-	logConfig := GetDefaultDailyLogConfig()
-	cutoffTime := time.Now().AddDate(0, 0, -logConfig.MaxAge)
-	cutoffDateStr := cutoffTime.Format("2006-01-02")
-
-	// 获取所有日期目录
-	entries, err := os.ReadDir(logConfig.BaseDir)
-	if err != nil {
-		global.APP_LOG.Error("读取日志目录失败", zap.Error(err))
-		return err
+	// 检查是否应该清理
+	if !coordinator.ShouldCleanup() {
+		// 今天已经清理过了，跳过
+		return nil
 	}
 
-	// 统计清理结果
-	cleanedCount := 0
-	errorCount := 0
+	// 通过协调器执行清理（只执行一次）
+	return coordinator.ExecuteCleanup(func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+		logConfig := GetDefaultDailyLogConfig()
+		cutoffTime := time.Now().AddDate(0, 0, -logConfig.MaxAge)
+		cutoffDateStr := cutoffTime.Format("2006-01-02")
+
+		// 获取所有日期目录
+		entries, err := os.ReadDir(logConfig.BaseDir)
+		if err != nil {
+			global.APP_LOG.Error("读取日志目录失败", zap.Error(err))
+			return err
 		}
 
-		// 检查是否是日期格式的目录名
-		dirName := entry.Name()
-		if matched, _ := filepath.Match("????-??-??", dirName); !matched {
-			continue
+		// 收集所有日期目录
+		var dateDirs []string
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			// 检查是否是日期格式的目录名
+			dirName := entry.Name()
+			if matched, _ := filepath.Match("????-??-??", dirName); !matched {
+				continue
+			}
+			dateDirs = append(dateDirs, dirName)
 		}
 
-		// 检查目录日期是否过期
-		if dirName < cutoffDateStr {
-			dirPath := filepath.Join(logConfig.BaseDir, dirName)
+		// 按日期排序
+		sort.Slice(dateDirs, func(i, j int) bool {
+			return dateDirs[i] > dateDirs[j]
+		})
 
+		// 收集需要删除的目录（避免重复删除）
+		toDelete := make(map[string]bool)
+
+		// 超过保留数量的目录
+		if len(dateDirs) > logConfig.MaxBackups {
+			for _, dateDir := range dateDirs[logConfig.MaxBackups:] {
+				toDelete[dateDir] = true
+			}
+		}
+
+		// 超过保留时间的目录
+		for _, dateDir := range dateDirs {
+			if dateDir < cutoffDateStr {
+				toDelete[dateDir] = true
+			}
+		}
+
+		// 执行删除
+		cleanedCount := 0
+		errorCount := 0
+		for dateDir := range toDelete {
+			dirPath := filepath.Join(logConfig.BaseDir, dateDir)
 			if err := os.RemoveAll(dirPath); err != nil {
 				errorCount++
-				// 只记录第一个错误的详细信息
 				if errorCount == 1 {
 					global.APP_LOG.Warn("删除过期日志目录失败",
 						zap.String("dir", dirPath),
@@ -533,17 +538,17 @@ func (s *LogRotationService) CleanupOldLogs() error {
 				cleanedCount++
 			}
 		}
-	}
 
-	// 汇总记录清理结果
-	if cleanedCount > 0 || errorCount > 0 {
-		global.APP_LOG.Info("清理过期日志目录完成",
-			zap.Int("cleaned", cleanedCount),
-			zap.Int("errors", errorCount),
-			zap.String("cutoffDate", cutoffDateStr))
-	}
+		// 汇总记录清理结果
+		if cleanedCount > 0 || errorCount > 0 {
+			global.APP_LOG.Info("清理过期日志目录完成",
+				zap.Int("cleaned", cleanedCount),
+				zap.Int("errors", errorCount),
+				zap.String("cutoffDate", cutoffDateStr))
+		}
 
-	return nil
+		return nil
+	})
 } // GetLogFiles 获取日志文件列表（按日期分文件夹结构）
 func (s *LogRotationService) GetLogFiles() ([]LogFileInfo, error) {
 	s.mu.RLock()

@@ -196,7 +196,7 @@ func (i *IncusProvider) sshCreateInstanceWithProgress(ctx context.Context, confi
 	// 获取节点hostname用于日志
 	hostname := "unknown"
 	if output, err := i.sshClient.Execute("hostname"); err == nil {
-		hostname = strings.TrimSpace(output)
+		hostname = utils.CleanCommandOutput(output)
 	}
 
 	global.APP_LOG.Info("开始在Incus节点上创建实例（使用SSH）",
@@ -274,6 +274,7 @@ func (i *IncusProvider) sshCreateInstanceWithProgress(ctx context.Context, confi
 
 	updateProgress(50, "启动实例...")
 	// 启动实例
+	time.Sleep(6 * time.Second)
 	_, err = i.sshClient.Execute(fmt.Sprintf("incus start %s", config.Name))
 	if err != nil {
 		return fmt.Errorf("启动实例失败: %w", err)
@@ -284,6 +285,31 @@ func (i *IncusProvider) sshCreateInstanceWithProgress(ctx context.Context, confi
 		global.APP_LOG.Warn("等待实例就绪超时，但继续配置流程",
 			zap.String("instance", config.Name),
 			zap.Error(err))
+	}
+
+	// 验证实例可以执行命令（容器和虚拟机都需要）
+	if config.InstanceType == "vm" {
+		updateProgress(58, "等待虚拟机Agent启动...")
+		if err := i.waitForInstanceExecReady(config.Name, 120); err != nil {
+			global.APP_LOG.Warn("等待虚拟机Agent启动超时",
+				zap.String("instanceName", config.Name),
+				zap.Error(err))
+			return fmt.Errorf("虚拟机Agent启动超时，无法继续配置: %w", err)
+		} else {
+			global.APP_LOG.Info("虚拟机Agent已启动",
+				zap.String("instanceName", config.Name))
+		}
+	} else {
+		updateProgress(58, "等待容器启动...")
+		if err := i.waitForInstanceExecReady(config.Name, 120); err != nil {
+			global.APP_LOG.Warn("等待容器启动超时",
+				zap.String("instanceName", config.Name),
+				zap.Error(err))
+			// 容器超时只是警告，继续尝试
+		} else {
+			global.APP_LOG.Info("容器已启动",
+				zap.String("instanceName", config.Name))
+		}
 	}
 
 	updateProgress(60, "配置实例资源限制...")
@@ -309,6 +335,15 @@ func (i *IncusProvider) sshCreateInstanceWithProgress(ctx context.Context, confi
 	}
 
 	updateProgress(80, "等待实例完全启动...")
+	if err := i.waitForInstanceExecReady(config.Name, 120); err != nil {
+		global.APP_LOG.Warn("等待容器启动超时",
+			zap.String("instanceName", config.Name),
+			zap.Error(err))
+		// 容器超时只是警告，继续尝试
+	} else {
+		global.APP_LOG.Info("容器已启动",
+			zap.String("instanceName", config.Name))
+	}
 	// 查找实例ID用于pmacct初始化
 	var instanceID uint
 	var instance providerModel.Instance
@@ -409,16 +444,7 @@ func (i *IncusProvider) sshCreateInstanceWithProgress(ctx context.Context, confi
 				zap.String("instanceName", config.Name))
 		}
 	}
-	updateProgress(95, "等待Agent启动...")
-	if err := i.waitForVMAgentReady(config.Name, 120); err != nil {
-		global.APP_LOG.Warn("等待Agent启动超时，尝试直接设置SSH密码",
-			zap.String("instanceName", config.Name),
-			zap.Error(err))
-	} else {
-		global.APP_LOG.Info("Agent已启动，可以设置SSH密码",
-			zap.String("instanceName", config.Name))
-	}
-	// 最后设置SSH密码 - 在所有其他配置完成后
+	// 最后设置SSH密码 - Agent已在启动后等待完成
 	updateProgress(98, "配置SSH密码...")
 	if err := i.configureInstanceSSHPassword(ctx, config); err != nil {
 		// SSH密码设置失败也不应该阻止实例创建，记录错误即可
@@ -619,7 +645,7 @@ func (i *IncusProvider) sshDeleteInstance(id string) error {
 	// 获取节点hostname用于日志
 	hostname := "unknown"
 	if output, err := i.sshClient.Execute("hostname"); err == nil {
-		hostname = strings.TrimSpace(output)
+		hostname = utils.CleanCommandOutput(output)
 	}
 
 	global.APP_LOG.Info("开始在Incus节点上删除实例（使用SSH）",

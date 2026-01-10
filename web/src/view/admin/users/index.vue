@@ -216,8 +216,29 @@
           </template>
         </el-table-column>
         <el-table-column
+          prop="expiresAt"
+          :label="$t('admin.users.expiresAt')"
+          width="180"
+          align="center"
+        >
+          <template #default="scope">
+            <div v-if="scope.row.expiresAt">
+              <el-tag 
+                :type="isExpired(scope.row.expiresAt) ? 'danger' : 'success'"
+                size="small"
+              >
+                {{ formatDateTime(scope.row.expiresAt) }}
+              </el-tag>
+              <div v-if="scope.row.isManualExpiry" style="margin-top: 4px;">
+                <el-tag size="small" type="info">{{ $t('admin.users.manualExpiry') }}</el-tag>
+              </div>
+            </div>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
+        <el-table-column
           :label="$t('common.actions')"
-          width="250"
+          width="350"
           fixed="right"
           align="center"
         >
@@ -258,6 +279,13 @@
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
+              <el-button
+                size="small"
+                type="warning"
+                @click="handleSetExpiry(scope.row)"
+              >
+                {{ $t('admin.users.setExpiry') }}
+              </el-button>
               <el-button
                 size="small"
                 :type="scope.row.status === 1 ? 'danger' : 'success'"
@@ -575,6 +603,49 @@
         </div>
       </template>
     </el-dialog>
+
+    <!-- 设置过期时间对话框 -->
+    <el-dialog
+      v-model="showSetExpiryDialog"
+      :title="$t('admin.users.setExpiry')"
+      width="500px"
+    >
+      <el-form
+        label-width="120px"
+      >
+        <el-form-item :label="$t('admin.users.username')">
+          <el-input 
+            v-model="freezeForm.username" 
+            disabled
+          />
+        </el-form-item>
+        <el-form-item :label="$t('admin.users.expiresAt')">
+          <el-date-picker
+            v-model="freezeForm.expiresAt"
+            type="datetime"
+            :placeholder="$t('admin.users.selectExpiryTime')"
+            format="YYYY-MM-DD HH:mm:ss"
+            value-format="YYYY-MM-DDTHH:mm:ssZ"
+            style="width: 100%;"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button @click="showSetExpiryDialog = false">
+            {{ $t('common.cancel') }}
+          </el-button>
+          <el-button
+            type="primary"
+            :loading="freezeLoading"
+            @click="confirmSetExpiry"
+          >
+            {{ $t('common.confirm') }}
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
   </div>
 </template>
 
@@ -592,7 +663,8 @@ import {
   batchUpdateUserStatus,
   batchUpdateUserLevel,
   updateUserLevel,
-  resetUserPassword
+  resetUserPassword,
+  setUserExpiry
 } from '@/api/admin'
 
 const { t } = useI18n()
@@ -614,6 +686,15 @@ const resetPasswordForm = reactive({
 })
 const resetPasswordLoading = ref(false)
 const generatedPassword = ref('')
+
+// 冻结管理相关
+const showSetExpiryDialog = ref(false)
+const freezeLoading = ref(false)
+const freezeForm = reactive({
+  userId: null,
+  username: '',
+  expiresAt: null
+})
 
 // 搜索相关
 const searchUsername = ref('')
@@ -1081,6 +1162,51 @@ const copyPassword = async () => {
     console.error('复制失败:', error)
     ElMessage.error(t('user.profile.copyFailed'))
   }
+}
+
+// 设置过期时间
+const handleSetExpiry = (user) => {
+  freezeForm.userId = user.id
+  freezeForm.username = user.username
+  freezeForm.expiresAt = user.expiresAt || null
+  showSetExpiryDialog.value = true
+}
+
+// 确认设置过期时间
+const confirmSetExpiry = async () => {
+  try {
+    freezeLoading.value = true
+    await setUserExpiry({
+      userID: freezeForm.userId,
+      expiresAt: freezeForm.expiresAt
+    })
+    ElMessage.success(t('admin.users.setExpirySuccess'))
+    showSetExpiryDialog.value = false
+    await loadUsers()
+  } catch (error) {
+    ElMessage.error(t('admin.users.setExpiryFailed'))
+  } finally {
+    freezeLoading.value = false
+  }
+}
+
+// 格式化日期时间
+const formatDateTime = (dateTimeStr) => {
+  if (!dateTimeStr) return '-'
+  const date = new Date(dateTimeStr)
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+// 检查是否已过期
+const isExpired = (dateTimeStr) => {
+  if (!dateTimeStr) return false
+  return new Date(dateTimeStr) < new Date()
 }
 
 // 分页处理

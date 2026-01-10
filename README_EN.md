@@ -18,6 +18,8 @@ An extensible universal virtualization management platform that supports LXD, In
 
 ## Quick Deployment
 
+Avoid compiling from source whenever possible. We recommend deploying using separate binary files or directly pulling the Docker image for deployment.
+
 ### Method 1: Using Pre-built Images
 
 Use pre-built multi-architecture images that automatically downloads the appropriate version for your system architecture.
@@ -27,9 +29,9 @@ Use pre-built multi-architecture images that automatically downloads the appropr
 | Image Tag | Description | Use Case |
 |-----------|-------------|----------|
 | `spiritlhl/oneclickvirt:latest` | All-in-one version (built-in database) | Quick deployment |
-| `spiritlhl/oneclickvirt:20251221` | All-in-one version with specific date | Fixed version requirement |
+| `spiritlhl/oneclickvirt:20260110` | All-in-one version with specific date | Fixed version requirement |
 | `spiritlhl/oneclickvirt:no-db` | Standalone database version | Without database |
-| `spiritlhl/oneclickvirt:no-db-20251221` | Standalone database version with date | Without database |
+| `spiritlhl/oneclickvirt:no-db-20260110` | Standalone database version with date | Without database |
 
 All images support both `linux/amd64` and `linux/arm64` architectures.
 

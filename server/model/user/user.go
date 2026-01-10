@@ -31,9 +31,10 @@ type User struct {
 	Level    int    `json:"level" gorm:"default:1;index:idx_level"`   // 用户等级，用于权限控制
 	UserType string `json:"userType" gorm:"default:user;size:16"`     // 用户类型：user, admin, super_admin等
 
-	// 配额管理（传统系统兼容字段）
-	UsedQuota  int `json:"usedQuota" gorm:"default:0"`  // 已使用配额
-	TotalQuota int `json:"totalQuota" gorm:"default:0"` // 总配额限制
+	// 配额管理（两阶段配额系统）
+	UsedQuota    int `json:"usedQuota" gorm:"default:0"`    // 已确认使用的配额（稳定状态实例）
+	PendingQuota int `json:"pendingQuota" gorm:"default:0"` // 待确认的配额（创建中/重置中实例）
+	TotalQuota   int `json:"totalQuota" gorm:"default:0"`   // 总配额限制
 
 	// 流量管理（MB为单位）
 	TotalTraffic   int64      `json:"totalTraffic" gorm:"default:0"`       // 当月流量配额（MB），根据用户等级自动设置
@@ -50,6 +51,10 @@ type User struct {
 	// 其他信息
 	InviteCode  string     `json:"inviteCode" gorm:"size:32"` // 注册时使用的邀请码
 	LastLoginAt *time.Time `json:"lastLoginAt"`               // 最后登录时间
+
+	// 过期管理
+	ExpiresAt      *time.Time `json:"expiresAt" gorm:"index:idx_expires_at"` // 用户过期时间，过期后自动禁用（Status设为0）
+	IsManualExpiry bool       `json:"isManualExpiry" gorm:"default:false"`   // 是否手动设置了过期时间（手动设置优先级高于全局配置）
 
 	// OAuth2关联信息
 	OAuth2ProviderID uint   `json:"oauth2ProviderId" gorm:"index"`   // OAuth2提供商ID（关联oauth2_providers表）

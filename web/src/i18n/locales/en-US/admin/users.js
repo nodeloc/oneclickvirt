@@ -54,5 +54,21 @@ export default {
   newPassword: "New Password",
   passwordResetInfo: "New password generated, please copy and send to user",
   copyPassword: "Copy Password",
-  loadUsersFailed: "Failed to load user list"
+  loadUsersFailed: "Failed to load user list",
+  freezeManage: "Freeze Management",
+  setExpiry: "Set Expiry Time",
+  setExpiryPrompt: "Please enter expiry time (Format: YYYY-MM-DD HH:MM:SS or YYYY-MM-DD), leave blank to clear",
+  setExpirySuccess: "Expiry time set successfully",
+  setExpiryFailed: "Failed to set expiry time",
+  dateFormatError: "Please enter correct date format or leave blank",
+  expiresAt: "Expires At",
+  selectExpiryTime: "Please select expiry time",
+  freeze: "Freeze User",
+  unfreeze: "Unfreeze User",
+  freezeStatus: "Freeze Status",
+  freezeReason: "Freeze Reason",
+  freezeSuccess: "Frozen successfully",
+  freezeFailed: "Freeze failed",
+  unfreezeSuccess: "Unfrozen successfully",
+  unfreezeFailed: "Unfreeze failed"
 }

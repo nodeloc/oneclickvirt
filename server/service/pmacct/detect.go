@@ -6,6 +6,7 @@ import (
 	"oneclickvirt/global"
 	providerModel "oneclickvirt/model/provider"
 	"oneclickvirt/provider"
+	"oneclickvirt/utils"
 	"regexp"
 	"strings"
 	"time"
@@ -98,7 +99,7 @@ echo "eth0"  # 使用默认值作为后备
 		return "eth0", nil // 返回默认值而不是错误
 	}
 
-	networkInterface := strings.TrimSpace(output)
+	networkInterface := utils.CleanCommandOutput(output)
 	if networkInterface == "" {
 		global.APP_LOG.Warn("检测到空接口名，使用默认值eth0")
 		return "eth0", nil
@@ -112,6 +113,38 @@ echo "eth0"  # 使用默认值作为后备
 	}
 
 	return networkInterface, nil
+}
+
+// verifyInterfaceExists 验证网络接口是否存在于宿主机上
+// 用于检查数据库中保存的网卡是否仍然有效（避免容器重启后网卡名变化）
+func (s *Service) verifyInterfaceExists(providerInstance provider.Provider, interfaceName string) bool {
+	if interfaceName == "" {
+		return false
+	}
+
+	// 执行快速检查命令
+	checkCmd := fmt.Sprintf("ip link show %s >/dev/null 2>&1 && echo 'EXISTS' || echo 'NOT_FOUND'", interfaceName)
+
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+
+	output, err := providerInstance.ExecuteSSHCommand(ctx, checkCmd)
+	if err != nil {
+		global.APP_LOG.Warn("验证网络接口存在性时执行命令失败",
+			zap.String("interface", interfaceName),
+			zap.Error(err))
+		return false
+	}
+
+	output = utils.CleanCommandOutput(output)
+	exists := strings.Contains(output, "EXISTS")
+
+	if !exists {
+		global.APP_LOG.Warn("网络接口已不存在",
+			zap.String("interface", interfaceName))
+	}
+
+	return exists
 }
 
 // detectVethInterface 检测容器对应的veth接口（用于Docker/LXD/Incus）
@@ -247,7 +280,7 @@ exit 1
 		return "", fmt.Errorf("failed to execute veth detection command: %w", err)
 	}
 
-	vethName := strings.TrimSpace(output)
+	vethName := utils.CleanCommandOutput(output)
 	if vethName == "" || strings.HasPrefix(vethName, "ERROR:") {
 		return "", fmt.Errorf("无法检测容器 %s 的veth接口: %s", instanceName, vethName)
 	}
@@ -357,7 +390,7 @@ exit 1
 		return "", fmt.Errorf("failed to execute Proxmox interface detection: %w", err)
 	}
 
-	interfaceName := strings.TrimSpace(output)
+	interfaceName := utils.CleanCommandOutput(output)
 	if interfaceName == "" || strings.HasPrefix(interfaceName, "ERROR:") {
 		return "", fmt.Errorf("无法检测Proxmox实例 %s (ID: %s) 的网络接口: %s", instanceName, instanceID, interfaceName)
 	}
@@ -432,7 +465,7 @@ exit 1
 		return "", fmt.Errorf("failed to detect interface by MAC: %w", err)
 	}
 
-	interfaceName := strings.TrimSpace(output)
+	interfaceName := utils.CleanCommandOutput(output)
 	if interfaceName == "" || strings.HasPrefix(interfaceName, "ERROR:") {
 		return "", fmt.Errorf("无法通过MAC地址 %s 找到接口", macAddress)
 	}
@@ -458,23 +491,40 @@ type NetworkInterfaceInfo struct {
 func (s *Service) detectNetworkInterfaces(providerInstance provider.Provider, instanceName string, instance *providerModel.Instance, hasIPv6 bool) (*NetworkInterfaceInfo, error) {
 	providerType := providerInstance.GetType()
 	info := &NetworkInterfaceInfo{}
+	needRedetect := false
 
 	// 优先从数据库中获取已保存的网络接口信息
 	if instance.PmacctInterfaceV4 != "" {
-		info.IPv4Interface = instance.PmacctInterfaceV4
-		global.APP_LOG.Info("使用数据库中保存的IPv4网络接口",
-			zap.String("instance", instanceName),
-			zap.String("interfaceV4", info.IPv4Interface))
+		// 验证保存的网卡是否仍然存在（避免容器重启后网卡名变化）
+		if s.verifyInterfaceExists(providerInstance, instance.PmacctInterfaceV4) {
+			info.IPv4Interface = instance.PmacctInterfaceV4
+			global.APP_LOG.Info("使用数据库中保存的IPv4网络接口（已验证存在）",
+				zap.String("instance", instanceName),
+				zap.String("interfaceV4", info.IPv4Interface))
+		} else {
+			global.APP_LOG.Warn("数据库中保存的IPv4网络接口已不存在，将重新检测",
+				zap.String("instance", instanceName),
+				zap.String("oldInterfaceV4", instance.PmacctInterfaceV4))
+			needRedetect = true
+		}
 	}
 	if hasIPv6 && instance.PmacctInterfaceV6 != "" {
-		info.IPv6Interface = instance.PmacctInterfaceV6
-		global.APP_LOG.Info("使用数据库中保存的IPv6网络接口",
-			zap.String("instance", instanceName),
-			zap.String("interfaceV6", info.IPv6Interface))
+		// 验证保存的网卡是否仍然存在
+		if s.verifyInterfaceExists(providerInstance, instance.PmacctInterfaceV6) {
+			info.IPv6Interface = instance.PmacctInterfaceV6
+			global.APP_LOG.Info("使用数据库中保存的IPv6网络接口（已验证存在）",
+				zap.String("instance", instanceName),
+				zap.String("interfaceV6", info.IPv6Interface))
+		} else {
+			global.APP_LOG.Warn("数据库中保存的IPv6网络接口已不存在，将重新检测",
+				zap.String("instance", instanceName),
+				zap.String("oldInterfaceV6", instance.PmacctInterfaceV6))
+			needRedetect = true
+		}
 	}
 
-	// 如果数据库中已有完整的接口信息，直接返回
-	if info.IPv4Interface != "" && (!hasIPv6 || info.IPv6Interface != "") {
+	// 如果数据库中已有完整的接口信息且都验证通过，直接返回
+	if !needRedetect && info.IPv4Interface != "" && (!hasIPv6 || info.IPv6Interface != "") {
 		return info, nil
 	}
 
